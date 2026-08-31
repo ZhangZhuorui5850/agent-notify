@@ -7,7 +7,7 @@ Send Codex, Claude Code, and shell task completion events from WSL to the Window
 ## Features
 
 - Windows notification balloons with info, warning, and error levels
-- Codex `notify` integration
+- Codex `Stop` hook integration for CLI and the VS Code extension
 - Claude Code `Stop` hook integration
 - Generic JSON event input for other agents and scripts
 - Command wrapper that preserves the original exit code
@@ -30,9 +30,9 @@ cd agent-notify
 ~/.local/bin/agent-notify test
 ```
 
-`setup` updates the user-level Codex and Claude Code settings. Each original file is copied to an adjacent `*.agent-notify.backup` file.
+`setup` updates the user-level Codex and Claude Code settings. Each original file is copied to an adjacent `*.agent-notify.backup` file. After setup, reload VS Code, enter `/hooks` in Codex, open the `Stop` hook, and press `t` to trust Agent Notify.
 
-The official Codex configuration reference defines `notify` as an external command that receives a JSON payload. The setting belongs in `~/.codex/config.toml`.
+The Codex integration uses the official `Stop` lifecycle hook in `~/.codex/hooks.json`. Codex sends the hook event as JSON on standard input after each completed turn. The hook returns immediately after launching the hidden Windows notification process.
 
 ## Usage
 
@@ -63,7 +63,7 @@ agent-notify doctor
 agent-notify self-test
 ```
 
-Hook errors are recorded at `~/.local/state/agent-notify/errors.log`.
+Successful Agent hook calls are recorded at `~/.local/state/agent-notify/events.log`. Hook errors are recorded at `~/.local/state/agent-notify/errors.log`.
 
 ## Uninstall
 
@@ -95,7 +95,7 @@ The uninstaller removes the Codex and Claude Code integration entries together w
 
 ## References
 
-- [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+- [Codex Hooks](https://learn.chatgpt.com/docs/hooks)
 - [Microsoft NotifyIcon documentation](https://learn.microsoft.com/en-us/dotnet/desktop/winforms/controls/notifyicon-component-overview-windows-forms)
 - [Microsoft desktop toast requirements](https://learn.microsoft.com/en-us/windows/win32/shell/enable-desktop-toast-with-appusermodelid)
 

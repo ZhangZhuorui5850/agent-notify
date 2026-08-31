@@ -45,10 +45,10 @@ def parse_agent_event(source: str, data: dict[str, Any]) -> tuple[str, str, str]
             return None
         agent = "Codex"
         message = data.get("last-assistant-message")
-    elif source == "claude":
+    elif source in {"codex-hook", "claude"}:
         if data.get("hook_event_name") != "Stop":
             return None
-        agent = "Claude Code"
+        agent = "Codex" if source == "codex-hook" else "Claude Code"
         message = data.get("last_assistant_message")
     else:
         raise ValueError(f"unsupported source: {source}")
@@ -150,6 +150,16 @@ def log_error(error: Exception) -> None:
         pass
 
 
+def log_event(source: str, title: str) -> None:
+    try:
+        directory = state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / "events.log").open("a", encoding="utf-8") as log:
+            log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {source} {title}\n")
+    except OSError:
+        pass
+
+
 def atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = path.stat().st_mode if path.exists() else 0o600
@@ -167,23 +177,39 @@ def backup(path: Path) -> None:
 
 
 def setup_codex(command: str) -> None:
-    path = Path.home() / ".codex/config.toml"
-    text = path.read_text(encoding="utf-8") if path.exists() else ""
-    line = f"notify = {json.dumps([command, 'codex'], ensure_ascii=False)}"
-    pattern = re.compile(r"(?m)^notify\s*=.*$")
-    updated, count = pattern.subn(line, text, count=1)
-    if count == 0:
-        table = re.search(r"(?m)^\[", text)
-        index = table.start() if table else len(text)
-        prefix = text[:index].rstrip()
-        suffix = text[index:].lstrip("\n")
-        updated = f"{prefix}\n{line}\n\n{suffix}" if prefix else f"{line}\n\n{suffix}"
-    updated = updated.rstrip() + "\n"
-    if updated == text:
-        print(f"Codex already configured: {path}")
-        return
+    config_path = Path.home() / ".codex/config.toml"
+    if config_path.exists():
+        text = config_path.read_text(encoding="utf-8")
+        updated = re.sub(r"(?m)^notify\s*=.*agent-notify.*\n?", "", text, count=1)
+        if updated != text:
+            backup(config_path)
+            atomic_write(config_path, updated)
+
+    path = Path.home() / ".codex/hooks.json"
+    data: dict[str, Any] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    stop_hooks = data.setdefault("hooks", {}).setdefault("Stop", [])
+    hook_command = f"{command} codex-hook"
+    existing = next((
+        hook
+        for group in stop_hooks if isinstance(group, dict)
+        for hook in group.get("hooks", [])
+        if isinstance(hook, dict) and hook.get("command") == hook_command
+    ), None)
+    if existing:
+        changed = existing.pop("async", None) is not None
+        changed = existing.get("timeout") != 15 or changed
+        existing["timeout"] = 15
+        if not changed:
+            print(f"Codex already configured: {path}")
+            return
+    else:
+        stop_hooks.append({"hooks": [{
+            "type": "command",
+            "command": hook_command,
+            "timeout": 15,
+        }]})
     backup(path)
-    atomic_write(path, updated)
+    atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     print(f"configured Codex: {path}")
 
 
@@ -214,20 +240,41 @@ def setup(target: str) -> int:
     command = str(Path(sys.argv[0]).resolve())
     if target in {"codex", "all"}:
         setup_codex(command)
+        print("Codex next step: restart the client, open /hooks, and trust the Agent Notify Stop hook.")
     if target in {"claude", "all"}:
         setup_claude(command)
     return 0
 
 
 def remove_codex() -> None:
-    path = Path.home() / ".codex/config.toml"
+    config_path = Path.home() / ".codex/config.toml"
+    if config_path.exists():
+        text = config_path.read_text(encoding="utf-8")
+        updated = re.sub(r"(?m)^notify\s*=.*agent-notify.*\n?", "", text, count=1)
+        if updated != text:
+            backup(config_path)
+            atomic_write(config_path, updated)
+    path = Path.home() / ".codex/hooks.json"
     if not path.exists():
         return
-    text = path.read_text(encoding="utf-8")
-    updated = re.sub(r"(?m)^notify\s*=.*agent-notify.*\n?", "", text, count=1)
-    if updated != text:
+    data: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    stop_hooks = data.get("hooks", {}).get("Stop", [])
+    changed = False
+    for group in stop_hooks:
+        hooks = group.get("hooks", []) if isinstance(group, dict) else []
+        kept = [hook for hook in hooks if "agent-notify codex-hook" not in str(hook.get("command", ""))]
+        if len(kept) != len(hooks):
+            group["hooks"] = kept
+            changed = True
+    hooks_config = data.get("hooks")
+    if isinstance(hooks_config, dict):
+        hooks_config["Stop"] = [
+            group for group in stop_hooks
+            if isinstance(group, dict) and group.get("hooks")
+        ]
+    if changed:
         backup(path)
-        atomic_write(path, updated)
+        atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
         print(f"removed Codex integration: {path}")
 
 
@@ -272,7 +319,7 @@ def doctor() -> int:
     except FileNotFoundError as error:
         checks.append(("Windows PowerShell", False, str(error)))
     command = str(Path(sys.argv[0]).resolve())
-    codex_path = Path.home() / ".codex/config.toml"
+    codex_path = Path.home() / ".codex/hooks.json"
     claude_path = Path.home() / ".claude/settings.json"
     checks.append(("Codex integration", codex_path.exists() and command in codex_path.read_text(encoding="utf-8"), str(codex_path)))
     checks.append(("Claude Code integration", claude_path.exists() and command in claude_path.read_text(encoding="utf-8"), str(claude_path)))
@@ -294,6 +341,11 @@ def self_test() -> int:
         "cwd": "/repo/app",
         "last_assistant_message": "Ready",
     }) == ("Claude Code · app", "Ready", "info")
+    assert parse_agent_event("codex-hook", {
+        "hook_event_name": "Stop",
+        "cwd": "/repo/app",
+        "last_assistant_message": "Ready",
+    }) == ("Codex · app", "Ready", "info")
     assert parse_generic_event({"source": "Build", "project": "app", "message": "Failed", "level": "error"}) == ("Build · app", "Failed", "error")
     assert "FromBase64String" in powershell_command("Codex", "完成", "info", 5000)
     print("agent-notify self-test passed")
@@ -306,6 +358,7 @@ def usage() -> int:
   agent-notify event                 # read a generic JSON event from stdin
   agent-notify run TITLE -- COMMAND [ARG ...]
   agent-notify codex JSON
+  agent-notify codex-hook            # read Codex Stop hook JSON from stdin
   agent-notify claude                # read Claude hook JSON from stdin
   agent-notify setup codex|claude|all
   agent-notify remove codex|claude|all
@@ -335,7 +388,7 @@ def main() -> int:
     if len(sys.argv) < 2:
         return usage()
     action, args = sys.argv[1], sys.argv[2:]
-    hook_action = action in {"codex", "claude"}
+    hook_action = action in {"codex", "codex-hook", "claude"}
     try:
         if action == "send" and len(args) in {2, 3}:
             level = args[2] if len(args) == 3 else "info"
@@ -348,9 +401,18 @@ def main() -> int:
             return run_command(args)
         if action == "codex" and len(args) == 1:
             event = parse_agent_event("codex", json.loads(args[0]))
+            if event:
+                log_event(action, event[0])
+            return notify(*event) if event else 0
+        if action == "codex-hook":
+            event = parse_agent_event("codex-hook", json.load(sys.stdin))
+            if event:
+                log_event(action, event[0])
             return notify(*event) if event else 0
         if action == "claude":
             event = parse_agent_event("claude", json.load(sys.stdin))
+            if event:
+                log_event(action, event[0])
             return notify(*event) if event else 0
         if action == "setup" and len(args) == 1 and args[0] in {"codex", "claude", "all"}:
             return setup(args[0])
