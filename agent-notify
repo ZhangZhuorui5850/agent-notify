@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Send Codex, Claude Code, and shell task events to Windows from WSL."""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+APP_NAME = "Agent Notify"
+DEFAULT_MESSAGE = "任务已完成"
+POWERSHELL_PATHS = (
+    "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+    "powershell.exe",
+)
+LEVELS = {
+    "info": ("Information", "Info"),
+    "warning": ("Warning", "Warning"),
+    "error": ("Error", "Error"),
+}
+
+
+def compact(value: object, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def project_name(cwd: object) -> str:
+    path = os.path.normpath(str(cwd or ""))
+    return os.path.basename(path) or path or "Agent"
+
+
+def parse_agent_event(source: str, data: dict[str, Any]) -> tuple[str, str, str] | None:
+    if source == "codex":
+        if data.get("type") != "agent-turn-complete":
+            return None
+        agent = "Codex"
+        message = data.get("last-assistant-message")
+    elif source == "claude":
+        if data.get("hook_event_name") != "Stop":
+            return None
+        agent = "Claude Code"
+        message = data.get("last_assistant_message")
+    else:
+        raise ValueError(f"unsupported source: {source}")
+
+    title = f"{agent} · {project_name(data.get('cwd'))}"
+    return compact(title, 64), compact(message, 240) or DEFAULT_MESSAGE, "info"
+
+
+def parse_generic_event(data: dict[str, Any]) -> tuple[str, str, str]:
+    source = compact(data.get("source"), 24) or APP_NAME
+    project = compact(data.get("project"), 32)
+    fallback_title = f"{source} · {project}" if project else source
+    title = compact(data.get("title") or fallback_title, 64)
+    message = compact(data.get("message"), 240) or DEFAULT_MESSAGE
+    level = str(data.get("level") or "info").lower()
+    if level not in LEVELS:
+        raise ValueError("level must be info, warning, or error")
+    return title, message, level
+
+
+def find_powershell() -> str:
+    configured = os.environ.get("AGENT_NOTIFY_POWERSHELL")
+    if configured:
+        return configured
+    for candidate in POWERSHELL_PATHS:
+        if os.path.isabs(candidate) and os.path.isfile(candidate):
+            return candidate
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    raise FileNotFoundError("Windows PowerShell was not found; run this command inside WSL")
+
+
+def powershell_command(title: str, message: str, level: str, duration_ms: int) -> str:
+    title64 = base64.b64encode(title.encode()).decode()
+    message64 = base64.b64encode(message.encode()).decode()
+    system_icon, balloon_icon = LEVELS[level]
+    return f"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$title = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{title64}'))
+$message = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{message64}'))
+$notification = New-Object System.Windows.Forms.NotifyIcon
+$notification.Icon = [System.Drawing.SystemIcons]::{system_icon}
+$notification.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::{balloon_icon}
+$notification.BalloonTipTitle = $title
+$notification.BalloonTipText = $message
+$notification.Visible = $true
+$notification.ShowBalloonTip({duration_ms})
+Start-Sleep -Milliseconds {duration_ms + 500}
+$notification.Dispose()
+"""
+
+
+def notify(
+    title: str,
+    message: str,
+    level: str = "info",
+    *,
+    wait: bool = False,
+    duration_ms: int = 5000,
+) -> int:
+    duration_ms = max(1000, min(duration_ms, 30000))
+    command = [
+        find_powershell(),
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        powershell_command(compact(title, 64), compact(message, 240), level, duration_ms),
+    ]
+    if wait:
+        return subprocess.run(command, check=False).returncode
+    subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return 0
+
+
+def state_dir() -> Path:
+    return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "agent-notify"
+
+
+def log_error(error: Exception) -> None:
+    try:
+        directory = state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / "errors.log").open("a", encoding="utf-8") as log:
+            log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {type(error).__name__}: {error}\n")
+    except OSError:
+        pass
+
+
+def atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode if path.exists() else 0o600
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as temp:
+        temp.write(text)
+        temp_path = Path(temp.name)
+    os.chmod(temp_path, mode)
+    os.replace(temp_path, path)
+
+
+def backup(path: Path) -> None:
+    destination = Path(f"{path}.agent-notify.backup")
+    if path.exists() and not destination.exists():
+        shutil.copy2(path, destination)
+
+
+def setup_codex(command: str) -> None:
+    path = Path.home() / ".codex/config.toml"
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    line = f"notify = {json.dumps([command, 'codex'], ensure_ascii=False)}"
+    pattern = re.compile(r"(?m)^notify\s*=.*$")
+    updated, count = pattern.subn(line, text, count=1)
+    if count == 0:
+        table = re.search(r"(?m)^\[", text)
+        index = table.start() if table else len(text)
+        prefix = text[:index].rstrip()
+        suffix = text[index:].lstrip("\n")
+        updated = f"{prefix}\n{line}\n\n{suffix}" if prefix else f"{line}\n\n{suffix}"
+    updated = updated.rstrip() + "\n"
+    if updated == text:
+        print(f"Codex already configured: {path}")
+        return
+    backup(path)
+    atomic_write(path, updated)
+    print(f"configured Codex: {path}")
+
+
+def setup_claude(command: str) -> None:
+    path = Path.home() / ".claude/settings.json"
+    data: dict[str, Any] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    stop_hooks = data.setdefault("hooks", {}).setdefault("Stop", [])
+    hook_command = f"{command} claude"
+    exists = any(
+        isinstance(group, dict)
+        and any(
+            isinstance(hook, dict) and hook.get("command") == hook_command
+            for hook in group.get("hooks", [])
+        )
+        for group in stop_hooks
+    )
+    if not exists:
+        stop_hooks.append({"hooks": [{"type": "command", "command": hook_command, "async": True}]})
+    else:
+        print(f"Claude Code already configured: {path}")
+        return
+    backup(path)
+    atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    print(f"configured Claude Code: {path}")
+
+
+def setup(target: str) -> int:
+    command = str(Path(sys.argv[0]).resolve())
+    if target in {"codex", "all"}:
+        setup_codex(command)
+    if target in {"claude", "all"}:
+        setup_claude(command)
+    return 0
+
+
+def remove_codex() -> None:
+    path = Path.home() / ".codex/config.toml"
+    if not path.exists():
+        return
+    text = path.read_text(encoding="utf-8")
+    updated = re.sub(r"(?m)^notify\s*=.*agent-notify.*\n?", "", text, count=1)
+    if updated != text:
+        backup(path)
+        atomic_write(path, updated)
+        print(f"removed Codex integration: {path}")
+
+
+def remove_claude() -> None:
+    path = Path.home() / ".claude/settings.json"
+    if not path.exists():
+        return
+    data: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    stop_hooks = data.get("hooks", {}).get("Stop", [])
+    changed = False
+    for group in stop_hooks:
+        hooks = group.get("hooks", []) if isinstance(group, dict) else []
+        kept = [hook for hook in hooks if "agent-notify claude" not in str(hook.get("command", ""))]
+        if len(kept) != len(hooks):
+            group["hooks"] = kept
+            changed = True
+    hooks_config = data.get("hooks")
+    if isinstance(hooks_config, dict):
+        hooks_config["Stop"] = [
+            group for group in stop_hooks
+            if isinstance(group, dict) and group.get("hooks")
+        ]
+    if changed:
+        backup(path)
+        atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        print(f"removed Claude Code integration: {path}")
+
+
+def remove(target: str) -> int:
+    if target in {"codex", "all"}:
+        remove_codex()
+    if target in {"claude", "all"}:
+        remove_claude()
+    return 0
+
+
+def doctor() -> int:
+    checks: list[tuple[str, bool, str]] = []
+    try:
+        powershell = find_powershell()
+        checks.append(("Windows PowerShell", True, powershell))
+    except FileNotFoundError as error:
+        checks.append(("Windows PowerShell", False, str(error)))
+    command = str(Path(sys.argv[0]).resolve())
+    codex_path = Path.home() / ".codex/config.toml"
+    claude_path = Path.home() / ".claude/settings.json"
+    checks.append(("Codex integration", codex_path.exists() and command in codex_path.read_text(encoding="utf-8"), str(codex_path)))
+    checks.append(("Claude Code integration", claude_path.exists() and command in claude_path.read_text(encoding="utf-8"), str(claude_path)))
+    for name, okay, detail in checks:
+        print(f"{'OK' if okay else 'WARN':4}  {name}: {detail}")
+    return 0 if checks[0][1] else 1
+
+
+def self_test() -> int:
+    assert compact("  one\n two  ", 20) == "one two"
+    assert project_name("/home/user/app") == "app"
+    assert parse_agent_event("codex", {
+        "type": "agent-turn-complete",
+        "cwd": "/repo/app",
+        "last-assistant-message": "Done",
+    }) == ("Codex · app", "Done", "info")
+    assert parse_agent_event("claude", {
+        "hook_event_name": "Stop",
+        "cwd": "/repo/app",
+        "last_assistant_message": "Ready",
+    }) == ("Claude Code · app", "Ready", "info")
+    assert parse_generic_event({"source": "Build", "project": "app", "message": "Failed", "level": "error"}) == ("Build · app", "Failed", "error")
+    assert "FromBase64String" in powershell_command("Codex", "完成", "info", 5000)
+    print("agent-notify self-test passed")
+    return 0
+
+
+def usage() -> int:
+    print("""usage:
+  agent-notify send TITLE MESSAGE [info|warning|error]
+  agent-notify event                 # read a generic JSON event from stdin
+  agent-notify run TITLE -- COMMAND [ARG ...]
+  agent-notify codex JSON
+  agent-notify claude                # read Claude hook JSON from stdin
+  agent-notify setup codex|claude|all
+  agent-notify remove codex|claude|all
+  agent-notify test | doctor | self-test""", file=sys.stderr)
+    return 2
+
+
+def run_command(args: list[str]) -> int:
+    if len(args) < 2:
+        return usage()
+    title = args[0]
+    command = args[1:]
+    if command[0] == "--":
+        command = command[1:]
+    if not command:
+        return usage()
+    started = time.monotonic()
+    result = subprocess.run(command, check=False)
+    elapsed = time.monotonic() - started
+    level = "info" if result.returncode == 0 else "error"
+    status = "完成" if result.returncode == 0 else f"失败（退出码 {result.returncode}）"
+    notify(title, f"{status}，耗时 {elapsed:.1f} 秒", level)
+    return result.returncode
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        return usage()
+    action, args = sys.argv[1], sys.argv[2:]
+    hook_action = action in {"codex", "claude"}
+    try:
+        if action == "send" and len(args) in {2, 3}:
+            level = args[2] if len(args) == 3 else "info"
+            if level not in LEVELS:
+                raise ValueError("level must be info, warning, or error")
+            return notify(args[0], args[1], level)
+        if action == "event":
+            return notify(*parse_generic_event(json.load(sys.stdin)))
+        if action == "run":
+            return run_command(args)
+        if action == "codex" and len(args) == 1:
+            event = parse_agent_event("codex", json.loads(args[0]))
+            return notify(*event) if event else 0
+        if action == "claude":
+            event = parse_agent_event("claude", json.load(sys.stdin))
+            return notify(*event) if event else 0
+        if action == "setup" and len(args) == 1 and args[0] in {"codex", "claude", "all"}:
+            return setup(args[0])
+        if action == "remove" and len(args) == 1 and args[0] in {"codex", "claude", "all"}:
+            return remove(args[0])
+        if action == "test":
+            return notify(f"{APP_NAME} · 测试", "Windows 通知功能运行正常", wait=True)
+        if action == "doctor":
+            return doctor()
+        if action == "self-test":
+            return self_test()
+        return usage()
+    except Exception as error:
+        log_error(error)
+        if hook_action:
+            return 0
+        print(f"agent-notify: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
