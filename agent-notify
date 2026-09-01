@@ -17,15 +17,17 @@ from typing import Any
 
 
 APP_NAME = "Agent Notify"
+APP_ID = "ZhangZhuorui.AgentNotify"
+VERSION = "0.2.1"
 DEFAULT_MESSAGE = "任务已完成"
 POWERSHELL_PATHS = (
     "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
     "powershell.exe",
 )
 LEVELS = {
-    "info": ("Information", "Info"),
-    "warning": ("Warning", "Warning"),
-    "error": ("Error", "Error"),
+    "info": ("Information", "Info", ""),
+    "warning": ("Warning", "Warning", "警告"),
+    "error": ("Error", "Error", "错误"),
 }
 
 
@@ -82,16 +84,52 @@ def find_powershell() -> str:
     raise FileNotFoundError("Windows PowerShell was not found; run this command inside WSL")
 
 
+def find_icon() -> Path:
+    script = Path(__file__).resolve()
+    candidates = (
+        script.parent / "assets/agent-notify.png",
+        script.parent.parent / "share/agent-notify/agent-notify.png",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError("agent-notify.png was not found; run install.sh again")
+
+
 def powershell_command(title: str, message: str, level: str, duration_ms: int) -> str:
     title64 = base64.b64encode(title.encode()).decode()
     message64 = base64.b64encode(message.encode()).decode()
-    system_icon, balloon_icon = LEVELS[level]
-    return f"""
+    system_icon, balloon_icon, attribution = LEVELS[level]
+    attribution64 = base64.b64encode(attribution.encode()).decode()
+    return rf"""
 $ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
+$ProgressPreference = 'SilentlyContinue'
 $title = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{title64}'))
 $message = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{message64}'))
+$attribution = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{attribution64}'))
+$identityKey = 'HKCU:\Software\Classes\AppUserModelId\{APP_ID}'
+if (Test-Path $identityKey) {{
+    try {{
+        [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null
+        [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime] | Out-Null
+        $titleXml = [Security.SecurityElement]::Escape($title)
+        $messageXml = [Security.SecurityElement]::Escape($message)
+        $attributionXml = if ($attribution) {{
+            "<text placement='attribution'>$([Security.SecurityElement]::Escape($attribution))</text>"
+        }} else {{ '' }}
+        $payload = "<toast><visual><binding template='ToastGeneric'><text hint-maxLines='1'>$titleXml</text><text>$messageXml</text>$attributionXml</binding></visual></toast>"
+        $document = New-Object Windows.Data.Xml.Dom.XmlDocument
+        $document.LoadXml($payload)
+        $toast = [Windows.UI.Notifications.ToastNotification]::new($document)
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{APP_ID}').Show($toast)
+        Start-Sleep -Milliseconds 250
+        exit 0
+    }} catch {{
+        # The WinForms balloon below keeps notifications available on older systems.
+    }}
+}}
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
 $notification = New-Object System.Windows.Forms.NotifyIcon
 $notification.Icon = [System.Drawing.SystemIcons]::{system_icon}
 $notification.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::{balloon_icon}
@@ -102,6 +140,59 @@ $notification.ShowBalloonTip({duration_ms})
 Start-Sleep -Milliseconds {duration_ms + 500}
 $notification.Dispose()
 """
+
+
+def windows_setup_command(icon: bytes) -> str:
+    icon64 = base64.b64encode(icon).decode()
+    return rf"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$directory = Join-Path $env:LOCALAPPDATA '{APP_NAME}'
+$iconPath = Join-Path $directory 'agent-notify.png'
+New-Item -ItemType Directory -Path $directory -Force | Out-Null
+[IO.File]::WriteAllBytes($iconPath, [Convert]::FromBase64String('{icon64}'))
+$key = 'HKCU:\Software\Classes\AppUserModelId\{APP_ID}'
+New-Item -Path $key -Force | Out-Null
+New-ItemProperty -Path $key -Name DisplayName -Value '{APP_NAME}' -PropertyType ExpandString -Force | Out-Null
+New-ItemProperty -Path $key -Name IconUri -Value $iconPath -PropertyType ExpandString -Force | Out-Null
+New-ItemProperty -Path $key -Name IconBackgroundColor -Value 'FF4338CA' -PropertyType String -Force | Out-Null
+Write-Output "configured Windows app identity: $key"
+"""
+
+
+def windows_remove_command() -> str:
+    return rf"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+try {{
+    [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null
+    [Windows.UI.Notifications.ToastNotificationManager]::History.Clear('{APP_ID}')
+}} catch {{}}
+$key = 'HKCU:\Software\Classes\AppUserModelId\{APP_ID}'
+$directory = Join-Path $env:LOCALAPPDATA '{APP_NAME}'
+Remove-Item -Path $key -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -Path $directory -Recurse -Force -ErrorAction SilentlyContinue
+Write-Output "removed Windows app identity: $key"
+"""
+
+
+def run_powershell(command: str, *, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            find_powershell(),
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ],
+        check=False,
+        text=True,
+        capture_output=capture,
+    )
 
 
 def notify(
@@ -236,8 +327,16 @@ def setup_claude(command: str) -> None:
     print(f"configured Claude Code: {path}")
 
 
+def setup_windows() -> None:
+    result = run_powershell(windows_setup_command(find_icon().read_bytes()), capture=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "Windows app identity setup failed")
+    print(result.stdout.strip())
+
+
 def setup(target: str) -> int:
     command = str(Path(sys.argv[0]).resolve())
+    setup_windows()
     if target in {"codex", "all"}:
         setup_codex(command)
         print("Codex next step: restart the client, open /hooks, and trust the Agent Notify Stop hook.")
@@ -303,12 +402,59 @@ def remove_claude() -> None:
         print(f"removed Claude Code integration: {path}")
 
 
+def remove_windows() -> None:
+    result = run_powershell(windows_remove_command(), capture=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "Windows app identity removal failed")
+    print(result.stdout.strip())
+
+
 def remove(target: str) -> int:
+    cleanups = []
     if target in {"codex", "all"}:
-        remove_codex()
+        cleanups.append(("Codex", remove_codex))
     if target in {"claude", "all"}:
-        remove_claude()
+        cleanups.append(("Claude Code", remove_claude))
+    if target in {"windows", "all"}:
+        cleanups.append(("Windows", remove_windows))
+    errors = []
+    for name, cleanup in cleanups:
+        try:
+            cleanup()
+        except Exception as error:
+            errors.append(f"{name}: {error}")
+    if errors:
+        raise RuntimeError("cleanup failed — " + "; ".join(errors))
     return 0
+
+
+def windows_identity_status() -> tuple[bool, str]:
+    command = rf"""
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new()
+$key = 'HKCU:\Software\Classes\AppUserModelId\{APP_ID}'
+if (!(Test-Path $key)) {{ Write-Output 'identity missing'; exit 2 }}
+$identity = Get-ItemProperty -Path $key
+if ($identity.DisplayName -ne '{APP_NAME}') {{ Write-Output 'display name invalid'; exit 3 }}
+if (!(Test-Path $identity.IconUri)) {{ Write-Output "icon missing: $($identity.IconUri)"; exit 4 }}
+Write-Output "$($identity.DisplayName) [{APP_ID}] — $($identity.IconUri)"
+"""
+    result = run_powershell(command, capture=True)
+    detail = (result.stdout or result.stderr).strip()
+    return result.returncode == 0, detail
+
+
+def configured_hook(path: Path, action: str) -> str | None:
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    suffix = f"agent-notify {action}"
+    return next((
+        command
+        for group in data.get("hooks", {}).get("Stop", []) if isinstance(group, dict)
+        for hook in group.get("hooks", []) if isinstance(hook, dict)
+        if isinstance(command := hook.get("command"), str) and command.endswith(suffix)
+    ), None)
 
 
 def doctor() -> int:
@@ -318,14 +464,26 @@ def doctor() -> int:
         checks.append(("Windows PowerShell", True, powershell))
     except FileNotFoundError as error:
         checks.append(("Windows PowerShell", False, str(error)))
-    command = str(Path(sys.argv[0]).resolve())
+    try:
+        identity_okay, identity_detail = windows_identity_status()
+        checks.append(("Windows app identity", identity_okay, identity_detail))
+    except FileNotFoundError as error:
+        checks.append(("Windows app identity", False, str(error)))
     codex_path = Path.home() / ".codex/hooks.json"
     claude_path = Path.home() / ".claude/settings.json"
-    checks.append(("Codex integration", codex_path.exists() and command in codex_path.read_text(encoding="utf-8"), str(codex_path)))
-    checks.append(("Claude Code integration", claude_path.exists() and command in claude_path.read_text(encoding="utf-8"), str(claude_path)))
     for name, okay, detail in checks:
         print(f"{'OK' if okay else 'WARN':4}  {name}: {detail}")
-    return 0 if checks[0][1] else 1
+    for name, path, action in (
+        ("Codex integration", codex_path, "codex-hook"),
+        ("Claude Code integration", claude_path, "claude"),
+    ):
+        command = configured_hook(path, action)
+        print(f"{'OK' if command else 'INFO':4}  {name}: {command or f'not configured — {path}'}")
+    error_path = state_dir() / "errors.log"
+    errors = error_path.read_text(encoding="utf-8").splitlines() if error_path.exists() else []
+    error_detail = f"latest: {errors[-1]} — {error_path}" if errors else f"none recorded — {error_path}"
+    print(f"INFO  Hook errors: {error_detail}")
+    return 0 if all(check[1] for check in checks) else 1
 
 
 def self_test() -> int:
@@ -347,7 +505,25 @@ def self_test() -> int:
         "last_assistant_message": "Ready",
     }) == ("Codex · app", "Ready", "info")
     assert parse_generic_event({"source": "Build", "project": "app", "message": "Failed", "level": "error"}) == ("Build · app", "Failed", "error")
-    assert "FromBase64String" in powershell_command("Codex", "完成", "info", 5000)
+    toast = powershell_command("Codex <build>", "完成 & ready", "warning", 5000)
+    assert APP_ID in toast
+    assert "ToastGeneric" in toast
+    assert "SecurityElement]::Escape" in toast
+    assert base64.b64encode("警告".encode()).decode() in toast
+    assert APP_ID in windows_setup_command(b"png")
+    assert base64.b64encode(b"png").decode() in windows_setup_command(b"png")
+    assert APP_ID in windows_remove_command()
+    hooks = {
+        "hooks": {"Stop": [{"hooks": [{
+            "type": "command",
+            "command": "/home/user/.local/bin/agent-notify codex-hook",
+        }]}]}
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "hooks.json"
+        path.write_text(json.dumps(hooks), encoding="utf-8")
+        assert configured_hook(path, "codex-hook") == "/home/user/.local/bin/agent-notify codex-hook"
+        assert configured_hook(path, "claude") is None
     print("agent-notify self-test passed")
     return 0
 
@@ -360,9 +536,9 @@ def usage() -> int:
   agent-notify codex JSON
   agent-notify codex-hook            # read Codex Stop hook JSON from stdin
   agent-notify claude                # read Claude hook JSON from stdin
-  agent-notify setup codex|claude|all
-  agent-notify remove codex|claude|all
-  agent-notify test | doctor | self-test""", file=sys.stderr)
+  agent-notify setup windows|codex|claude|all
+  agent-notify remove windows|codex|claude|all
+  agent-notify test | doctor | self-test | version""", file=sys.stderr)
     return 2
 
 
@@ -414,16 +590,22 @@ def main() -> int:
             if event:
                 log_event(action, event[0])
             return notify(*event) if event else 0
-        if action == "setup" and len(args) == 1 and args[0] in {"codex", "claude", "all"}:
+        if action == "setup" and len(args) == 1 and args[0] in {"windows", "codex", "claude", "all"}:
             return setup(args[0])
-        if action == "remove" and len(args) == 1 and args[0] in {"codex", "claude", "all"}:
+        if action == "remove" and len(args) == 1 and args[0] in {"windows", "codex", "claude", "all"}:
             return remove(args[0])
         if action == "test":
-            return notify(f"{APP_NAME} · 测试", "Windows 通知功能运行正常", wait=True)
+            result = notify(f"{APP_NAME} · 测试", "Windows 通知功能运行正常", wait=True)
+            if result == 0:
+                print("Notification sent. Check the banner or press Win+N to open Notification Center.")
+            return result
         if action == "doctor":
             return doctor()
         if action == "self-test":
             return self_test()
+        if action in {"version", "--version"}:
+            print(f"{APP_NAME} {VERSION}")
+            return 0
         return usage()
     except Exception as error:
         log_error(error)
